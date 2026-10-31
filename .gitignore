@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.key
+/.aws/
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime results
+main/results/
+
+# Local audit and review documents
+/docs/
+
+# Existing local backup archive
+/20261012-145431.zip
+
+# Temporary
+*.log
+*.tmp

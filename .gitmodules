@@ -1,0 +1,3 @@
+[submodule "ToolFuzz"]
+	path = ToolFuzz
+	url = https://github.com/eth-sri/ToolFuzz.git
