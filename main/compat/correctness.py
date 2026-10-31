@@ -35,6 +35,15 @@ from src.toolfuzz.dataclasses import (
 from src.toolfuzz.logging_mixin import LoggingMixin
 
 
+try:
+    from ddgs.exceptions import DDGSException
+except ImportError:
+    # Correctness tests for other tools do not require the search dependency.
+    SEARCH_ERRORS = ()
+else:
+    SEARCH_ERRORS = (DDGSException,)
+
+
 class CompatibleCorrectnessPromptGenerator(
     CorrectnessPromptGenerator
 ):
@@ -168,6 +177,36 @@ class CompatibleCorrectnessTester(CorrectnessTester):
         self.prompt_model = prompt_model
         self.judge_model = judge_model
 
+    def run_prompt(self, prompt):
+        try:
+            # The upstream method resets context in finally, including when a
+            # DDGS error escapes. Do not reset it a second time here.
+            return super().run_prompt(prompt)
+        except SEARCH_ERRORS as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            return None, TestResult(
+                prompt=prompt,
+                tool_arguments="Unavailable: tool invocation was interrupted",
+                tool_output="Tool FAILURE",
+                agent_output=f"Search tool failed: {error}",
+                tool_failure=True,
+                # Preserve the upstream failure-record schema. This is not a
+                # judge score: the reason/trace explicitly mark evaluation skipped.
+                unexpected_agent_output=0,
+                agent_output_not_relevant=True,
+                llm_agent_out_reason=(
+                    f"Correctness was not evaluated because the search tool failed: {error}"
+                ),
+                trace=json.dumps(
+                    {
+                        "tool_error": str(exc),
+                        "error_type": f"{type(exc).__module__}.{type(exc).__name__}",
+                        "evaluation_skipped": True,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+
     def test(self):
         oracle = CompatibleCorrectnessOracle(
             self.judge_model
@@ -250,19 +289,22 @@ class CompatibleCorrectnessTester(CorrectnessTester):
                 # Original ToolFuzz consistency checks
                 # ----------------------------------------
 
-                (
-                    tool_output_inconsistency,
-                    output_buckets,
-                ) = oracle.evaluate_tool_output(
-                    outs
-                )
-
-                (
-                    tool_arguments_inconsistency,
-                    args_buckets,
-                ) = oracle.evaluate_tool_arguments(
-                    outs
-                )
+                if outs:
+                    (
+                        tool_output_inconsistency,
+                        output_buckets,
+                    ) = oracle.evaluate_tool_output(outs)
+                    (
+                        tool_arguments_inconsistency,
+                        args_buckets,
+                    ) = oracle.evaluate_tool_arguments(outs)
+                else:
+                    # No successful calls means there is nothing to compare.
+                    # Do not report an empty comparison as an inconsistency.
+                    tool_output_inconsistency = False
+                    tool_arguments_inconsistency = False
+                    output_buckets = []
+                    args_buckets = []
 
                 # ----------------------------------------
                 # Judge each answer

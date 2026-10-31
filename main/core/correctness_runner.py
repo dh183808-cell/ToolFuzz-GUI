@@ -158,6 +158,12 @@ def run_correctness(
         _serialize_result(result)
         for result in tester.results
     ]
+    individual_results = [
+        item
+        for prompt_set in results
+        for item in prompt_set["individual_run_test_results"]
+    ]
+    tool_failures = sum(item["tool_failure"] for item in individual_results)
 
     print("\n==========================================")
     print("Finished")
@@ -181,6 +187,8 @@ def run_correctness(
         },
         summary={
             "prompt_set_count": len(results),
+            "prompt_count": len(individual_results),
+            "tool_failure_count": tool_failures,
         },
         results=results,
         json_path=str(output_path) + ".json",
