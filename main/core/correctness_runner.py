@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from main.compat.correctness import CompatibleCorrectnessTester
 from main.compat.react_agent_new import CompatibleReactAgentNew
 from main.core.model_provider import (
@@ -11,9 +9,11 @@ from main.core.run_result import (
     start_run,
 )
 
-
-MAIN_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_RESULTS_DIR = MAIN_DIR / "results"
+from main.core.run_reports import save_reports
+from main.core.run_store import (
+    DEFAULT_RESULTS_DIR, checked_directory, persist_run, redact_credentials,
+    report_path, task_directory,
+)
 
 
 def _serialize_result(result):
@@ -41,6 +41,9 @@ def run_correctness(
     prompt_set_iters=1,
     output_name=None,
     results_dir=None,
+    task_id=None,
+    persist_result=True,
+    run_context=None,
     clear_previous=True,
     title="ToolFuzz Correctness Test",
 ):
@@ -51,7 +54,13 @@ def run_correctness(
     experiments now and by the GUI later.
     """
 
-    run_context = start_run()
+    run_context = run_context or start_run()
+    task_id = task_id or run_context.run_id
+    results_dir = (
+        task_directory(task_id) if results_dir is None
+        else checked_directory(results_dir)
+    )
+    output_path = report_path(results_dir, output_name or "correctness")
 
     # ---------------------------------------------------------
     # 1. Models
@@ -124,31 +133,14 @@ def run_correctness(
     # 5. Save
     # ---------------------------------------------------------
 
-    if results_dir is None:
-        results_dir = DEFAULT_RESULTS_DIR
-    else:
-        results_dir = Path(results_dir)
-
-    results_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    if output_name is None:
-        output_name = f"correctness_{tool_name}"
-
-    output_path = results_dir / output_name
-
-    if clear_previous:
-        for suffix in (".json", ".html"):
-            old_file = Path(
-                str(output_path) + suffix
-            )
-
-            if old_file.exists():
-                old_file.unlink()
-
-    tester.save(str(output_path))
+    report_error = None
+    try:
+        save_reports(
+            tester.results, output_path, clear_previous=clear_previous,
+        )
+    except Exception as exc:
+        # A completed test remains completed even if its reports cannot be saved.
+        report_error = redact_credentials(f"{type(exc).__name__}: {exc}")
 
     # ---------------------------------------------------------
     # 6. Normalize result for experiment / GUI usage
@@ -172,7 +164,8 @@ def run_correctness(
     print(f"HTML : {output_path}.html")
     print("==========================================")
 
-    return build_run_result(
+    result = build_run_result(
+        task_id=task_id,
         context=run_context,
         status="completed",
         test_type="correctness",
@@ -194,3 +187,10 @@ def run_correctness(
         json_path=str(output_path) + ".json",
         html_path=str(output_path) + ".html",
     )
+
+    if report_error is not None:
+        result["artifacts"]["save_error"] = report_error
+
+    if persist_result:
+        return persist_run(result, task_id=task_id, directory=results_dir)
+    return result

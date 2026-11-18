@@ -36,10 +36,12 @@ def build_run_result(
     results,
     json_path,
     html_path,
+    task_id=None,
+    error=None,
 ):
     finished = datetime.now(timezone.utc)
 
-    return {
+    result = {
         "status": status,
         "test_type": test_type,
         "tool": tool,
@@ -48,8 +50,8 @@ def build_run_result(
         "summary": summary,
         "results": results,
         "artifacts": {
-            "json_path": str(json_path),
-            "html_path": str(html_path),
+            "json_path": str(json_path) if json_path is not None else None,
+            "html_path": str(html_path) if html_path is not None else None,
         },
         "metadata": {
             "run_id": context.run_id,
@@ -61,3 +63,9 @@ def build_run_result(
             ),
         },
     }
+
+    if task_id is not None:
+        result["metadata"]["task_id"] = str(task_id)
+    if error is not None:
+        result["error"] = str(error)
+    return result

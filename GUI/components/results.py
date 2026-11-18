@@ -166,10 +166,12 @@ def render_traces(result, language, prefix):
     render_trace(indexed[selected][1], language)
 
 
-def render_reports(result, language, prefix):
+def render_reports(result, language, prefix, *, report_root=None):
     for column, kind in zip(st.columns(2), ("json", "html")):
         with column:
-            name, data, message, error = read_report(result.get("artifacts"), kind)
+            name, data, message, error = read_report(
+                result.get("artifacts"), kind, allowed_root=report_root,
+            )
             if message:
                 st.info(tr(language, message, kind=kind.upper(), error=error))
             else:
@@ -180,12 +182,12 @@ def render_reports(result, language, prefix):
                 )
 
 
-def render_result(result, language):
+def render_result(result, language, *, report_root=None, key_prefix=None):
     result = mapping(result)
     kind = result_kind(result)
     data = dashboard(result)
     metadata = mapping(result.get("metadata"))
-    prefix = str(metadata.get("run_id") or "last_result")
+    prefix = key_prefix or str(metadata.get("run_id") or "last_result")
     st.subheader(tr(language, "dashboard"))
     labels = ("prompt_sets", "prompts", "tool_failures") if kind == "correctness" else ("records", "triggered", "not_triggered")
     values = (data["groups"], data["count"], data["yes"]) if kind == "correctness" else (data["count"], data["yes"], data["no"])
@@ -216,7 +218,7 @@ def render_result(result, language):
     with trace_tab:
         render_traces(result, language, prefix)
     with report_tab:
-        render_reports(result, language, prefix)
+        render_reports(result, language, prefix, report_root=report_root)
     with raw_tab:
         st.caption(tr(language, "raw_note"))
         st.json(result)

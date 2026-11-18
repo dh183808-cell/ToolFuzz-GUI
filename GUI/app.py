@@ -1,5 +1,6 @@
 import streamlit as st
 
+from GUI.components.history import render_history
 from GUI.components.results import render_result
 from GUI.i18n import LANGUAGES, tr
 from GUI.services.result_view import dashboard
@@ -11,6 +12,10 @@ from main.core.tool_registry import list_tool_options
 def language_changed():
     # Change only our URL parameter; preserve the task recovery marker.
     st.query_params["lang"] = st.session_state.language
+
+
+def view_changed():
+    st.query_params["view"] = st.session_state.result_view
 
 
 def init_language():
@@ -29,7 +34,7 @@ def restore_config(task):
     if task is None:
         return
     if (
-        task.status != "running"
+        task.status not in ("running", "cancelling")
         and st.session_state.get("displayed_task_id") == task.task_id
     ):
         return
@@ -73,6 +78,21 @@ def start_test(manager, displayed_task_id):
     manager.start(config, expected_task_id=displayed_task_id)
 
 
+def cancel_test(manager, displayed_task_id):
+    manager.cancel(displayed_task_id, expected_task_id=displayed_task_id)
+
+
+def clear_cancelled_widgets(task):
+    if task is None or task.status != "cancelled":
+        return
+    prefixes = [task.task_id + "_", "history_" + task.task_id + "_"]
+    if task.core_run_id:
+        prefixes.append(task.core_run_id + "_")
+    for key in list(st.session_state):
+        if isinstance(key, str) and any(key.startswith(prefix) for prefix in prefixes):
+            del st.session_state[key]
+
+
 def main():
     language = init_language()
     st.set_page_config(page_title=tr(language, "title"), page_icon="🧪", layout="wide")
@@ -81,7 +101,8 @@ def main():
 
     manager = get_task_manager()
     task = manager.snapshot()
-    running = task is not None and task.status == "running"
+    running = task is not None and task.status in ("running", "cancelling")
+    clear_cancelled_widgets(task)
     for key, value in {
         "model_name": DEFAULT_MODEL,
         "iterations": 1,
@@ -142,6 +163,11 @@ def main():
             disabled=running, on_click=start_test,
             args=(manager, task.task_id if task is not None else None),
         )
+        st.button(
+            tr(language, "cancel"), key="cancel_test", width="stretch",
+            disabled=task is None or task.status != "running", on_click=cancel_test,
+            args=(manager, task.task_id if task is not None else None),
+        )
         if st.session_state.get("start_error"):
             st.error(tr(language, st.session_state.start_error))
         if running:
@@ -166,6 +192,12 @@ def main():
                 tool=tool_labels.get(current.config.tool_id, current.config.tool_id),
                 seconds=current.duration_seconds,
             ))
+        elif current.status == "cancelling":
+            st.info(tr(language, "cancelling"))
+            if current.cleanup_error:
+                st.error(tr(language, "task_not_stopped"))
+        elif current.status == "cancelled":
+            st.info(tr(language, "cancelled"))
         elif current.status == "failed":
             st.error(tr(language, "failed", error=current.error))
         else:
@@ -177,6 +209,20 @@ def main():
                 st.success(tr(language, "completed"))
 
     show_task()
+
+    requested_view = st.query_params.get("view", "current")
+    st.session_state.setdefault("result_view", requested_view if requested_view in ("current", "history") else "current")
+    view = st.radio(
+        tr(language, "result_view"), ("current", "history"),
+        format_func=lambda value: tr(language, value), key="result_view",
+        horizontal=True, on_change=view_changed,
+    )
+    if view == "history":
+        render_history(language)
+        return
+
+    if task is not None and task.status in ("cancelling", "cancelled"):
+        return
 
     # Keep result interactions outside the timer fragment: they never submit a task.
     result = task.result if task is not None and task.status == "completed" else manager.last_result()

@@ -20,6 +20,7 @@ venv/
 
 # Runtime results
 main/results/
+experiment_runs/
 
 # Local audit and review documents
 /docs/

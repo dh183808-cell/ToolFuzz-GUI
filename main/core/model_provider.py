@@ -23,4 +23,6 @@ def create_deepseek_llm(
         api_key=api_key,
         base_url=DEFAULT_BASE_URL,
         temperature=temperature,
+        timeout=60,
+        max_retries=1,
     )

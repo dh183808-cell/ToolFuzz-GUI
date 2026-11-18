@@ -72,15 +72,24 @@ def parse_trace(value):
     return [], "trace_invalid"
 
 
-def read_report(artifacts, kind):
+def read_report(artifacts, kind, *, allowed_root=None):
     """Read only the actual artifact returned by a runner; never regenerate it."""
     path = mapping(artifacts).get(f"{kind}_path")
     if not isinstance(path, str) or not path.strip():
         return None, None, "report_missing", None
     try:
         report = Path(path)
+        if allowed_root is not None:
+            root = Path(allowed_root).resolve()
+            # P0 stores absolute paths; also support paths relative to the store
+            # or project (experiment_runs/<task>/report) without changing cwd.
+            if not report.is_absolute():
+                report = (root.parent if report.parts and report.parts[0] == root.name else root) / report
+            report = report.resolve()
+            if report != root and root not in report.parents:
+                return None, None, "report_outside_store", None
         if not report.is_file():
             return None, None, "report_missing", None
         return report.name, report.read_bytes(), None, None
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         return None, None, "report_unreadable", str(exc)
