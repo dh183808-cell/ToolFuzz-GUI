@@ -1,0 +1,3 @@
+# Optional HTTP entry point; install into the project environment, not upstream sources.
+fastapi==0.115.14
+uvicorn==0.52.4

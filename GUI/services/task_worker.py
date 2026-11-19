@@ -1,6 +1,7 @@
 """One isolated process tree per GUI task; no Streamlit or model imports here."""
 
 import json
+from contextlib import redirect_stdout, redirect_stderr
 import multiprocessing
 import os
 from pathlib import Path
@@ -11,6 +12,8 @@ from time import monotonic
 from time import sleep
 
 from main.core.run_store import redact_credentials, task_directory
+from main.core.credentials import credential_scope, protect_existing_loggers, SafeOutput
+import sys
 
 
 def _group_running(pid):
@@ -32,7 +35,21 @@ def _group_running(pid):
     except ProcessLookupError:
         return False
 
-def _child(connection, execute, task_id, config, context, staging):
+def _child(connection, execute, task_id, config, context, staging, temporary_credentials=None):
+    # Scope exists only in this spawned interpreter; no environment mutation.
+    with credential_scope(temporary_credentials):
+        stdout, stderr = SafeOutput(sys.stdout, temporary_credentials), SafeOutput(sys.stderr, temporary_credentials)
+        try:
+            with protect_existing_loggers(temporary_credentials), redirect_stdout(stdout), redirect_stderr(stderr):
+                _execute_child(connection, execute, task_id, config, context, staging)
+        finally:
+            stdout.finish()
+            stderr.finish()
+            if temporary_credentials is not None:
+                temporary_credentials.clear()
+
+
+def _execute_child(connection, execute, task_id, config, context, staging):
     try:
         if os.name == "posix":
             os.setsid()
@@ -154,7 +171,7 @@ class _WindowsJob:
 
 
 class TaskProcess:
-    def __init__(self, task_id, config, *, store_root=None, run_context=None, execute=None):
+    def __init__(self, task_id, config, *, store_root=None, run_context=None, execute=None, temporary_credentials=None):
         self.directory = task_directory(task_id, root=store_root)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.staging = Path(tempfile.mkdtemp(prefix=".worker-", dir=self.directory))
@@ -162,7 +179,7 @@ class TaskProcess:
         self.connection, child = context.Pipe()
         self._child_connection = child
         self.process = context.Process(
-            target=_child, args=(child, execute, task_id, config, run_context, str(self.staging)),
+            target=_child, args=(child, execute, task_id, config, run_context, str(self.staging), temporary_credentials),
             name=f"toolfuzz-{task_id}",
         )
         self.ready = False

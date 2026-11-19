@@ -171,6 +171,7 @@ def render_reports(result, language, prefix, *, report_root=None):
         with column:
             name, data, message, error = read_report(
                 result.get("artifacts"), kind, allowed_root=report_root,
+                task_id=mapping(result.get("metadata")).get("task_id") or mapping(result.get("metadata")).get("run_id"),
             )
             if message:
                 st.info(tr(language, message, kind=kind.upper(), error=error))

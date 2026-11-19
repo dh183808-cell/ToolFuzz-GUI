@@ -2,7 +2,7 @@ from main.compat.correctness import CompatibleCorrectnessTester
 from main.compat.react_agent_new import CompatibleReactAgentNew
 from main.core.model_provider import (
     DEFAULT_MODEL,
-    create_deepseek_llm,
+    check_model_calls, create_role_models, resolve_roles,
 )
 from main.core.run_result import (
     build_run_result,
@@ -35,6 +35,7 @@ def run_correctness(
     tool,
     *,
     model_name=DEFAULT_MODEL,
+    model_roles=None,
     prompt_temperature=0.4,
     agent_temperature=0,
     judge_temperature=0,
@@ -66,20 +67,18 @@ def run_correctness(
     # 1. Models
     # ---------------------------------------------------------
 
-    prompt_llm = create_deepseek_llm(
-        model_name=model_name,
-        temperature=prompt_temperature,
+    roles = resolve_roles(
+        model_roles, model_name=model_name,
+        prompt_temperature=prompt_temperature, agent_temperature=agent_temperature,
+        judge_temperature=judge_temperature, correctness=True,
     )
-
-    agent_llm = create_deepseek_llm(
-        model_name=model_name,
-        temperature=agent_temperature,
+    models = create_role_models(
+        roles, correctness=True, legacy=model_roles is None,
     )
-
-    judge_llm = create_deepseek_llm(
-        model_name=model_name,
-        temperature=judge_temperature,
-    )
+    prompt_llm, agent_llm = models["prompt"], models["agent"]
+    judge_llm = models["judge"]
+    model_name = roles.agent.model_id
+    secret_env_names = [getattr(roles, name).api_key_env for name in models]
 
     # ---------------------------------------------------------
     # 2. Agent
@@ -128,6 +127,8 @@ def run_correctness(
     # ---------------------------------------------------------
 
     tester.test()
+    # Compatibility testers may catch model exceptions; never publish their verdicts.
+    check_model_calls(models)
 
     # ---------------------------------------------------------
     # 5. Save
@@ -137,10 +138,11 @@ def run_correctness(
     try:
         save_reports(
             tester.results, output_path, clear_previous=clear_previous,
+            secret_env_names=secret_env_names,
         )
     except Exception as exc:
         # A completed test remains completed even if its reports cannot be saved.
-        report_error = redact_credentials(f"{type(exc).__name__}: {exc}")
+        report_error = redact_credentials(f"{type(exc).__name__}: {exc}", secret_env_names=secret_env_names)
 
     # ---------------------------------------------------------
     # 6. Normalize result for experiment / GUI usage
@@ -172,10 +174,11 @@ def run_correctness(
         tool=tool_name,
         model=model_name,
         config={
+            "model_roles": roles.summary(),
             "prompt_set_iters": prompt_set_iters,
-            "prompt_temperature": prompt_temperature,
-            "agent_temperature": agent_temperature,
-            "judge_temperature": judge_temperature,
+            "prompt_temperature": roles.prompt.temperature,
+            "agent_temperature": roles.agent.temperature,
+            "judge_temperature": roles.judge.temperature,
             "clear_previous": clear_previous,
         },
         summary={
@@ -191,6 +194,7 @@ def run_correctness(
     if report_error is not None:
         result["artifacts"]["save_error"] = report_error
 
+    result = redact_credentials(result, secret_env_names=secret_env_names)
     if persist_result:
         return persist_run(result, task_id=task_id, directory=results_dir)
     return result

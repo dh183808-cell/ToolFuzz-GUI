@@ -21,9 +21,27 @@ _SECRET_TEXT = re.compile(
 )
 
 
-def redact_credentials(value):
+def redact_credentials(value, *, secret_env_names=()):
     """Copy JSON data, including serialized traces, without credentials."""
-    secrets = [
+    # New model summaries carry environment variable names, never key values.
+    # Include custom names and short credentials explicitly referenced by this run.
+    names = set(secret_env_names)
+
+    def collect(item):
+        if isinstance(item, dict):
+            for key, val in item.items():
+                if key in ("key_env_name", "api_key_env") and isinstance(val, str):
+                    names.add(val)
+                else:
+                    collect(val)
+        elif isinstance(item, (list, tuple)):
+            for val in item:
+                collect(val)
+
+    collect(value)
+    from main.core.credentials import current_credentials
+    temporary = current_credentials()
+    secrets = list(temporary.values() if temporary else ()) + [os.environ[name] for name in names if os.environ.get(name)] + [
         secret for key, secret in os.environ.items()
         if _SECRET_KEY.search(key) and len(secret) >= 8
     ]
@@ -89,6 +107,93 @@ def report_path(directory, name):
     return path
 
 
+def resolve_report(raw, kind, *, task_id, root=None):
+    """Resolve a declared report in exactly one task, without rewriting records.
+
+    Missing legacy absolute paths can relocate only when their final components
+    are experiment_runs/<task_id>/<filename>. Arbitrary absolute paths never
+    fall back to a basename lookup. Internal worker/store files are not reports.
+    """
+    if kind not in ("json", "html") or not isinstance(raw, str) or not raw:
+        return None
+    root = Path(DEFAULT_RESULTS_DIR if root is None else root).resolve()
+    directory = task_directory(task_id, root=root)
+    if directory != root / task_id:
+        raise ValueError("Task directory is a link to another task")
+    if "\\" in raw or "\x00" in raw or ".." in Path(raw).parts:
+        raise ValueError("Unsafe report path")
+    path = Path(raw)
+    name = _identifier(path.name)
+    if (path.suffix != f".{kind}" or name.startswith(".")
+            or name.lower() in ("run_result.json", "response.json")):
+        raise ValueError("Not a downloadable report")
+    if path.is_absolute():
+        if path.parent != directory:
+            # Only missing, recognizable pre-move store paths may be relocated.
+            if (path.parts[-3:] != ("experiment_runs", task_id, name)
+                    or path.exists() or path.is_symlink()):
+                raise ValueError("Report is outside its task")
+            path = directory / name
+    elif path.parts == (name,):
+        path = directory / name
+    elif path.parts == (task_id, name):
+        path = root / path
+    elif path.parts == (root.name, task_id, name):
+        path = root.parent / path
+    else:
+        raise ValueError("Report is outside its task")
+    resolved = path.resolve()
+    if resolved.parent != directory or resolved.name != name:
+        raise ValueError("Report link is outside its task")
+    return resolved if resolved.is_file() else None
+
+
+def declared_reports(record, *, root=None):
+    """Existing declared JSON/HTML files plus their same-task template logo."""
+    metadata = record.get("metadata") or {}
+    artifacts = record.get("artifacts") or {}
+    if not isinstance(metadata, dict) or not isinstance(artifacts, dict):
+        return {}
+    task_id = metadata.get("task_id") or metadata.get("run_id")
+    files = {}
+    for kind in ("json", "html"):
+        try:
+            path = resolve_report(artifacts.get(f"{kind}_path"), kind, task_id=task_id, root=root)
+            if path is not None:
+                files[path.name] = path
+        except (OSError, ValueError, RuntimeError):
+            continue
+    if any(path.suffix == ".html" for path in files.values()):
+        try:
+            directory = task_directory(task_id, root=root)
+            logo = (directory / "toolfuzz.png").resolve()
+            if logo.parent == directory and logo.name == "toolfuzz.png" and logo.is_file():
+                files[logo.name] = logo
+        except (OSError, ValueError, RuntimeError):
+            pass
+    return files
+
+
+def _relative_artifacts(record, task_id, directory, root):
+    """Normalize the saved copy only; explicit custom results_dir stays intact."""
+    root = Path(DEFAULT_RESULTS_DIR if root is None else root).resolve()
+    if directory != root / task_id:
+        return
+    artifacts = record.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return
+    for kind in ("json", "html"):
+        raw = artifacts.get(f"{kind}_path")
+        if not isinstance(raw, str):
+            continue
+        try:
+            path = resolve_report(raw, kind, task_id=task_id, root=root)
+            if path is not None:
+                artifacts[f"{kind}_path"] = path.relative_to(root).as_posix()
+        except (OSError, ValueError, RuntimeError):
+            pass
+
+
 def save_run(result, *, task_id=None, root=None, directory=None):
     """Save a complete RunResult; return its path, raising on storage failure.
 
@@ -100,6 +205,7 @@ def save_run(result, *, task_id=None, root=None, directory=None):
     task_id = _identifier(task_id or record["metadata"].get("task_id") or run_id)
     record["metadata"]["task_id"] = task_id
     directory = task_directory(task_id, root=root) if directory is None else checked_directory(directory)
+    _relative_artifacts(record, task_id, directory, root)
     directory.mkdir(parents=True, exist_ok=True)
     destination = directory / "run_result.json"
     fd, temporary = tempfile.mkstemp(prefix=".run_result-", suffix=".tmp", dir=directory)
@@ -120,13 +226,16 @@ def load_run(task_id, *, root=None):
     """Return a valid record or None for a missing/unreadable/corrupt file."""
     path = task_directory(task_id, root=root) / "run_result.json"
     try:
+        # History/API must not follow a record-file link outside its own task.
+        if path.resolve().parent != path.parent:
+            return None
         record = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(record, dict) or not isinstance(record.get("metadata"), dict):
             return None
         if not record["metadata"].get("run_id"):
             return None
         return record
-    except (OSError, ValueError, RecursionError):
+    except (OSError, ValueError, RuntimeError):
         return None
 
 

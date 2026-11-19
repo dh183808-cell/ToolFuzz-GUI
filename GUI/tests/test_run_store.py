@@ -12,6 +12,7 @@ from importlib.util import find_spec
 import json
 from pathlib import Path
 import runpy
+import shutil
 import sys
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
@@ -62,9 +63,7 @@ def offline_dependencies(kind, records):
     """Only external boundaries are replaced; actual Runner/store/report code runs."""
     agent = ModuleType("main.compat.react_agent_new")
     agent.CompatibleReactAgentNew = lambda *args: SimpleNamespace(agent=object())
-    provider = ModuleType("main.core.model_provider")
-    provider.DEFAULT_MODEL = "offline-model"
-    provider.create_deepseek_llm = Mock(return_value=object())
+    from main.core import model_provider as provider
     runtime = ModuleType("main.compat.runtime_tester")
     correctness = ModuleType("main.compat.correctness")
     tester = Mock(return_value=SimpleNamespace(
@@ -77,14 +76,14 @@ def offline_dependencies(kind, records):
     utils.env.get_template.return_value.render.return_value = "<html>Offline report</html>"
     utils.transform_test_results = lambda values: values
     modules = {
-        agent.__name__: agent, provider.__name__: provider,
+        agent.__name__: agent,
         runtime.__name__: runtime, correctness.__name__: correctness,
         utils.__name__: utils,
     }
-    with patch.dict(sys.modules, modules), patch("main.core.run_reports.resources.files") as files:
+    with patch.dict(sys.modules, modules), patch.object(provider, "create_deepseek_llm", return_value=object()) as factory, patch("main.core.run_reports.resources.files") as files:
         files.return_value.joinpath.return_value.read_bytes.return_value = b"offline logo"
         namespace = runpy.run_path(str(PROJECT_ROOT / "main/core" / f"{kind}_runner.py"))
-        yield namespace[f"run_{kind}"], provider
+        yield namespace[f"run_{kind}"], SimpleNamespace(create_deepseek_llm=factory)
 
 
 def process_fixture(task_id, config, *, root, block=False, descendant=False, socket_block=False):
@@ -307,10 +306,12 @@ class RunStoreTests(unittest.TestCase):
                 self.assertEqual(actual["persistence"]["status"], "saved")
                 self.assertEqual(actual["metadata"]["run_id"], loaded["metadata"]["run_id"])
                 for report_kind in ("json", "html"):
-                    path = Path(loaded["artifacts"][f"{report_kind}_path"])
+                    self.assertFalse(Path(loaded["artifacts"][f"{report_kind}_path"]).is_absolute())
+                    path = self.root / loaded["artifacts"][f"{report_kind}_path"]
                     self.assertEqual(path.parent, self.root / kind)
                     self.assertTrue(path.is_file())
-                    self.assertIsNone(read_report(loaded["artifacts"], report_kind)[2])
+                    self.assertIsNone(read_report(loaded["artifacts"], report_kind, allowed_root=self.root, task_id=kind)[2])
+                    self.assertTrue(Path(actual["artifacts"][f"{report_kind}_path"]).is_absolute())
                     self.assertNotIn("hidden-report-key", path.read_text())
                 self.assertEqual(provider.create_deepseek_llm.call_count, 2 if kind == "runtime" else 3)
 
@@ -338,7 +339,7 @@ class RunStoreTests(unittest.TestCase):
                 loaded = load_run(task.task_id, root=self.root)
                 self.assertEqual((task.status, task.persistence_status), ("completed", "saved"))
                 for report_kind in ("json", "html"):
-                    path = Path(loaded["artifacts"][f"{report_kind}_path"])
+                    path = self.root / loaded["artifacts"][f"{report_kind}_path"]
                     self.assertEqual(path.parent, Path(task.result_path).parent)
                     self.assertTrue(path.is_file())
 
@@ -459,7 +460,7 @@ class RunStoreTests(unittest.TestCase):
 
     def test_history_report_paths_allow_only_files_inside_experiment_root(self):
         original = self.history_fixture()
-        path = Path(original["artifacts"]["json_path"])
+        path = self.root / original["artifacts"]["json_path"]
         for allowed in (str(path), "runtime-history/runtime.json", self.root.name + "/runtime-history/runtime.json"):
             self.assertEqual(read_report({"json_path": allowed}, "json", allowed_root=self.root)[1], path.read_bytes())
         with TemporaryDirectory() as outside:
@@ -711,15 +712,13 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual([path.name for path in (self.root / task.task_id).iterdir()], ["run_result.json"])
 
     def test_model_provider_has_bounded_timeout_and_retry_configuration(self):
-        module = ModuleType("langchain_openai")
-        module.ChatOpenAI = Mock()
-        with patch.dict(sys.modules, {"langchain_openai": module}), patch.dict(
-            "os.environ", {"DEEPSEEK_API_KEY": "offline-private-value"}
-        ):
-            provider = runpy.run_path(str(PROJECT_ROOT / "main/core/model_provider.py"))
-            provider["create_deepseek_llm"]()
-        self.assertEqual(module.ChatOpenAI.call_args.kwargs["timeout"], 60)
-        self.assertEqual(module.ChatOpenAI.call_args.kwargs["max_retries"], 1)
+        from main.core.model_provider import create_deepseek_llm
+        # The legacy entry point delegates to the configurable factory.
+        with patch("main.core.model_provider.create_llm") as factory:
+            create_deepseek_llm()
+        config = factory.call_args.args[0]
+        self.assertEqual(config.timeout, 60)
+        self.assertEqual(config.max_retries, 1)
 
     @unittest.skipUnless(find_spec("langchain_openai"), "Use the project venv for the default Runner import check")
     def test_default_spawned_runner_without_key_saves_failure_with_core_identity(self):
@@ -979,6 +978,154 @@ with tempfile.TemporaryDirectory() as root:
         self.assertNotIn("resource_tracker", loaded_err)
         self.assertTrue(loaded["dependency_lock"]["tqdm_semaphore"])
         self.assertEqual(loaded["remaining_semaphores"], [])
+
+
+class ReportMigrationTests(unittest.TestCase):
+    """Relocate real files in private stores; never read production experiments."""
+
+    def setUp(self):
+        temp = TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.workspace = Path(temp.name)
+        self.root = self.workspace / "old_workspace" / "experiment_runs"
+        self.root.mkdir(parents=True)
+
+    def fixture(self, kind="runtime", *, task_id="gui-task", status="completed", relative=False):
+        record = result(kind)
+        record["metadata"].update(task_id=task_id, run_id="different-core-id")
+        record["status"] = status
+        if status in ("failed", "cancelled"):
+            record.update(results=[], error="offline diagnostic")
+        directory = self.root / task_id
+        directory.mkdir()
+        for extension in ("json", "html"):
+            path = directory / f"{kind}.{extension}"
+            path.write_text('[]' if extension == "json" else f'<img src="toolfuzz.png"><a href="{kind}.json">JSON</a>')
+            record["artifacts"][f"{extension}_path"] = f"{task_id}/{path.name}" if relative else str(path)
+        (directory / "toolfuzz.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        # Simulate an unchanged pre-P2.2.1 record, bypassing new-write normalization.
+        (directory / "run_result.json").write_text(json.dumps(record), encoding="utf-8")
+        return record
+
+    def snapshot(self):
+        return {str(p.relative_to(self.root)): (p.read_bytes(), p.stat().st_mtime_ns)
+                for p in self.root.rglob('*') if p.is_file()}
+
+    def assert_readable(self, record):
+        from main.api.views import report_files
+        task_id = record["metadata"]["task_id"]
+        kind = record["test_type"]
+        files = report_files(record, self.root)
+        self.assertEqual(set(files), {f"{kind}.json", f"{kind}.html", "toolfuzz.png"})
+        for extension in ("json", "html"):
+            name, data, message, _ = read_report(record["artifacts"], extension, allowed_root=self.root, task_id=task_id)
+            self.assertIsNone(message)
+            self.assertEqual(data, files[name].read_bytes())
+        loaded = load_run(task_id, root=self.root)
+        self.assertEqual(loaded, record)
+        self.assertNotEqual(loaded["metadata"]["run_id"], task_id)
+
+    def test_legacy_absolute_paths_before_and_after_workspace_move_are_read_only(self):
+        for kind in ("runtime", "correctness"):
+            self.fixture(kind, task_id=kind)
+        before = self.snapshot()
+        for record in list_runs(root=self.root):
+            self.assert_readable(record)
+        self.root.parent.rename(self.workspace / "new_workspace")
+        self.root = self.workspace / "new_workspace" / "experiment_runs"
+        with patch.object(TaskManager, "start", side_effect=AssertionError("History executed a task")), patch(
+                "main.core.run_store.save_run", side_effect=AssertionError("History changed a record")):
+            for record in list_runs(root=self.root):
+                self.assert_readable(record)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_new_writes_are_relative_and_live_results_unchanged_after_move(self):
+        for kind in ("runtime", "correctness"):
+            original = self.fixture(kind, task_id=kind)
+            before = deepcopy(original)
+            returned = persist_run(original, task_id=kind, root=self.root)
+            self.assertEqual(returned["artifacts"], before["artifacts"])
+            self.assertEqual(original, before)
+            stored = load_run(kind, root=self.root)
+            for extension in ("json", "html"):
+                self.assertEqual(stored["artifacts"][f"{extension}_path"], f"{kind}/{kind}.{extension}")
+            self.assert_readable(stored)
+        before = self.snapshot()
+        shutil.move(self.root.parent, self.workspace / "new_workspace")
+        self.root = self.workspace / "new_workspace" / "experiment_runs"
+        for stored in list_runs(root=self.root):
+            self.assert_readable(stored)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_failed_and_cancelled_records_and_missing_reports_survive_move(self):
+        from main.api.views import report_files
+        for status in ("failed", "cancelled"):
+            self.fixture(task_id=status, status=status)
+        self.root.parent.rename(self.workspace / "new_workspace")
+        self.root = self.workspace / "new_workspace" / "experiment_runs"
+        for record in list_runs(root=self.root):
+            self.assert_readable(record)
+            self.assertEqual(record["status"], record["metadata"]["task_id"])
+        record = load_run("cancelled", root=self.root)
+        for name in ("runtime.json", "runtime.html", "toolfuzz.png"):
+            (self.root / "cancelled" / name).unlink()
+        self.assertEqual(report_files(record, self.root), {})
+        self.assertEqual(read_report(record["artifacts"], "json", allowed_root=self.root, task_id="cancelled")[2], "report_missing")
+
+    def test_shared_resolver_rejects_escape_cross_task_and_internal_files(self):
+        from main.api.views import report_files
+        record = self.fixture()
+        self.fixture(task_id="other-task")
+        directory = self.root / "gui-task"
+        outside = self.workspace / "private.json"
+        outside.write_text('private')
+        (directory / "linked.json").symlink_to(outside)
+        (directory / "response.json").write_text('private worker response')
+        (directory / "alias.json").symlink_to(directory / "run_result.json")
+        attacks = [str(outside), "/etc/private.json", "../gui-task/runtime.json",
+                   "gui-task/../gui-task/runtime.json", "other-task/runtime.json",
+                   "experiment_runs/other-task/runtime.json", str(self.root / "other-task/runtime.json"),
+                   "linked.json", "alias.json", "run_result.json", "response.json",
+                   str(directory / "run_result.json"), "gui-task\\runtime.json",
+                   str(self.workspace / "missing/experiment_runs/other-task/runtime.json"),
+                   str(self.workspace / "missing/other-store/gui-task/runtime.json")]
+        for raw in attacks:
+            with self.subTest(raw=raw):
+                bad = deepcopy(record)
+                bad["artifacts"] = {"json_path": raw}
+                with patch.object(Path, "read_bytes", side_effect=AssertionError("Unsafe file read")):
+                    self.assertEqual(report_files(bad, self.root), {})
+                    self.assertEqual(read_report(bad["artifacts"], "json", allowed_root=self.root, task_id="gui-task")[2], "report_outside_store")
+        (directory / "toolfuzz.png").unlink()
+        (directory / "toolfuzz.png").symlink_to(outside)
+        self.assertNotIn("toolfuzz.png", report_files(record, self.root))
+        (self.root / "alias-task").symlink_to(directory, target_is_directory=True)
+        alias = deepcopy(record)
+        alias["metadata"]["task_id"] = "alias-task"
+        alias["artifacts"] = {"json_path": "alias-task/runtime.json"}
+        self.assertEqual(report_files(alias, self.root), {})
+        self.assertEqual(read_report(alias["artifacts"], "json", allowed_root=self.root, task_id="alias-task")[2], "report_outside_store")
+
+    def test_existing_foreign_absolute_path_does_not_relocate_even_with_store_suffix(self):
+        from main.api.views import report_files
+        record = self.fixture()
+        target = self.workspace / "foreign/experiment_runs/gui-task/runtime.json"
+        target.parent.mkdir(parents=True)
+        target.write_text('private')
+        record["artifacts"] = {"json_path": str(target)}
+        self.assertEqual(report_files(record, self.root), {})
+
+    def test_custom_results_directory_and_output_names_keep_runner_contract(self):
+        for kind in ("runtime", "correctness"):
+            directory = self.workspace / (kind + "-custom")
+            with offline_dependencies(kind, []) as (run, _), redirect_stdout(io.StringIO()):
+                live = run(SimpleNamespace(name="offline"), results_dir=directory, output_name="my-report")
+            stored = json.loads((directory / "run_result.json").read_text())
+            self.assertEqual(stored["artifacts"], live["artifacts"])
+            for extension in ("json", "html"):
+                path = directory / f"my-report.{extension}"
+                self.assertEqual(live["artifacts"][f"{extension}_path"], str(path))
+                self.assertEqual(read_report(live["artifacts"], extension)[1], path.read_bytes())
 
 
 if __name__ == "__main__":

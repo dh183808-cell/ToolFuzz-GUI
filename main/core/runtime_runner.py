@@ -2,7 +2,7 @@ from main.compat.react_agent_new import CompatibleReactAgentNew
 from main.compat.runtime_tester import CompatibleRuntimeErrorTester
 from main.core.model_provider import (
     DEFAULT_MODEL,
-    create_deepseek_llm,
+    check_model_calls, create_role_models, resolve_roles,
 )
 from main.core.run_result import (
     build_run_result,
@@ -35,6 +35,7 @@ def run_runtime(
     tool,
     *,
     model_name=DEFAULT_MODEL,
+    model_roles=None,
     prompt_temperature=0,
     agent_temperature=0,
     fuzzer_iters=1,
@@ -65,15 +66,16 @@ def run_runtime(
     # 1. Models
     # ---------------------------------------------------------
 
-    prompt_llm = create_deepseek_llm(
-        model_name=model_name,
-        temperature=prompt_temperature,
+    roles = resolve_roles(
+        model_roles, model_name=model_name,
+        prompt_temperature=prompt_temperature, agent_temperature=agent_temperature,
     )
-
-    agent_llm = create_deepseek_llm(
-        model_name=model_name,
-        temperature=agent_temperature,
+    models = create_role_models(
+        roles, correctness=False, legacy=model_roles is None,
     )
+    prompt_llm, agent_llm = models["prompt"], models["agent"]
+    model_name = roles.agent.model_id
+    secret_env_names = [getattr(roles, name).api_key_env for name in models]
 
     # ---------------------------------------------------------
     # 2. Agent
@@ -120,6 +122,8 @@ def run_runtime(
     # ---------------------------------------------------------
 
     tester.test()
+    # Compatibility testers may catch model exceptions; never publish their verdicts.
+    check_model_calls(models)
 
     # ---------------------------------------------------------
     # 5. Save
@@ -129,10 +133,11 @@ def run_runtime(
     try:
         save_reports(
             tester.test_results, output_path, clear_previous=clear_previous,
+            secret_env_names=secret_env_names,
         )
     except Exception as exc:
         # A completed test remains completed even if its reports cannot be saved.
-        report_error = redact_credentials(f"{type(exc).__name__}: {exc}")
+        report_error = redact_credentials(f"{type(exc).__name__}: {exc}", secret_env_names=secret_env_names)
 
     # ---------------------------------------------------------
     # 6. Normalize result for experiment / GUI usage
@@ -168,9 +173,10 @@ def run_runtime(
         tool=tool_name,
         model=model_name,
         config={
+            "model_roles": roles.summary(),
             "fuzzer_iters": fuzzer_iters,
-            "prompt_temperature": prompt_temperature,
-            "agent_temperature": agent_temperature,
+            "prompt_temperature": roles.prompt.temperature,
+            "agent_temperature": roles.agent.temperature,
             "clear_previous": clear_previous,
         },
         summary={
@@ -185,6 +191,7 @@ def run_runtime(
     if report_error is not None:
         result["artifacts"]["save_error"] = report_error
 
+    result = redact_credentials(result, secret_env_names=secret_env_names)
     if persist_result:
         return persist_run(result, task_id=task_id, directory=results_dir)
     return result

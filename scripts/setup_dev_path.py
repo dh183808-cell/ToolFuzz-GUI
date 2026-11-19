@@ -10,6 +10,7 @@ import sys
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 TOOLFUZZ_ROOT = PROJECT_ROOT / "ToolFuzz"
+API_DEPS_ROOT = PROJECT_ROOT / ".venv" / "api-deps"
 
 
 if not TOOLFUZZ_ROOT.exists():
@@ -30,7 +31,7 @@ if not site_packages_list:
     )
 
 
-site_packages = Path(site_packages_list[0])
+site_packages = Path(site_packages_list[0]).resolve()
 
 
 print("Python executable:")
@@ -45,6 +46,15 @@ print(PROJECT_ROOT)
 print("\nToolFuzz root:")
 print(TOOLFUZZ_ROOT)
 
+print("\nAPI dependencies:")
+print(API_DEPS_ROOT)
+
+if not API_DEPS_ROOT.is_dir():
+    print(
+        "Warning: API dependencies directory does not exist. "
+        "Its path will still be recorded; the existing workspace paths remain available."
+    )
+
 
 # ============================================================
 # Create persistent development path
@@ -55,6 +65,7 @@ pth_file = site_packages / "toolfuzz_workspace.pth"
 content = (
     f"{PROJECT_ROOT}\n"
     f"{TOOLFUZZ_ROOT}\n"
+    f"{API_DEPS_ROOT}\n"
 )
 
 pth_file.write_text(

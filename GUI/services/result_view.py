@@ -4,6 +4,8 @@ import json
 import math
 from pathlib import Path
 
+from main.core.run_store import DEFAULT_RESULTS_DIR, resolve_report
+
 
 def mapping(value):
     return value if isinstance(value, dict) else {}
@@ -72,24 +74,33 @@ def parse_trace(value):
     return [], "trace_invalid"
 
 
-def read_report(artifacts, kind, *, allowed_root=None):
+def read_report(artifacts, kind, *, allowed_root=None, task_id=None):
     """Read only the actual artifact returned by a runner; never regenerate it."""
     path = mapping(artifacts).get(f"{kind}_path")
-    if not isinstance(path, str) or not path.strip():
+    if not isinstance(path, str) or not path.strip() or path == ".":
         return None, None, "report_missing", None
     try:
         report = Path(path)
-        if allowed_root is not None:
-            root = Path(allowed_root).resolve()
-            # P0 stores absolute paths; also support paths relative to the store
-            # or project (experiment_runs/<task>/report) without changing cwd.
-            if not report.is_absolute():
-                report = (root.parent if report.parts and report.parts[0] == root.name else root) / report
-            report = report.resolve()
-            if report != root and root not in report.parents:
+        if allowed_root is not None or (task_id is not None and not report.is_absolute()):
+            root = Path(DEFAULT_RESULTS_DIR if allowed_root is None else allowed_root).resolve()
+            if task_id is None:
+                # Compatibility for standalone callers; GUI supplies its record ID.
+                parts = report.relative_to(root).parts if report.is_absolute() else report.parts
+                if parts and parts[0] == root.name:
+                    parts = parts[1:]
+                if len(parts) != 2:
+                    if not (root / report).exists() and not (root / report).is_symlink():
+                        return None, None, "report_missing", None
+                    return None, None, "report_outside_store", None
+                task_id = parts[0]
+            try:
+                report = resolve_report(path, kind, task_id=task_id, root=root)
+            except ValueError:
                 return None, None, "report_outside_store", None
-        if not report.is_file():
+        if report is None or not report.is_file():
             return None, None, "report_missing", None
         return report.name, report.read_bytes(), None, None
+    except ValueError:
+        return None, None, "report_outside_store", None
     except (OSError, ValueError, RuntimeError) as exc:
         return None, None, "report_unreadable", str(exc)

@@ -13,6 +13,8 @@ from typing import Callable, Optional
 
 from GUI.services.task_worker import TaskProcess
 
+from main.core.model_provider import ModelRoles
+from main.core.credentials import credential_scope
 from main.core.run_result import RunContext, build_run_result, start_run
 from main.core.run_store import persist_run, redact_credentials, task_directory
 
@@ -30,6 +32,7 @@ class RunConfig:
     prompt_temperature: float
     agent_temperature: float
     judge_temperature: float = 0
+    model_roles: Optional[ModelRoles] = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,8 @@ def execute_test(task_id, config, *, store_root=None, results_dir=None, run_cont
         "task_id": task_id,
         "persist_result": False,  # TaskManager also records execution failures.
     }
+    if config.model_roles is not None:
+        kwargs["model_roles"] = config.model_roles
     if config.test_type == "Runtime":
         return run_runtime(
             **kwargs,
@@ -109,7 +114,7 @@ class TaskManager:
         with self._lock:
             return self._last_result
 
-    def start(self, config, *, expected_task_id=_UNSPECIFIED):
+    def start(self, config, *, expected_task_id=_UNSPECIFIED, temporary_credentials=None):
         """Atomically start a test, or reattach to the one already running."""
         with self._lock:
             current_id = self._task.task_id if self._task is not None else None
@@ -132,9 +137,10 @@ class TaskManager:
             self._task = task
             cancelled = Event()
             self._cancel_event = cancelled
+            owned_credentials = temporary_credentials.copy() if temporary_credentials else None
             worker = Thread(
                 target=self._run,
-                args=(task, cancelled, core_context),
+                args=(task, cancelled, core_context, owned_credentials),
                 name=f"toolfuzz-{task.task_id}",
                 daemon=True,
             )
@@ -142,6 +148,8 @@ class TaskManager:
             try:
                 worker.start()
             except Exception as exc:
+                if owned_credentials is not None:
+                    owned_credentials.clear()
                 self._task = self._finish(task, None, f"{type(exc).__name__}: {exc}", context=core_context)
                 self._cancel_event = None
                 self._monitor = None
@@ -162,7 +170,14 @@ class TaskManager:
 
     def _finish(self, task, result, error, *, context=None, cancelled=False, cleanup_error=None, worker_info=None):
         finished_perf = perf_counter()
-        error = redact_credentials(error)
+        task_config = asdict(task.config)
+        if isinstance(task.config.model_roles, ModelRoles):
+            task_config["model_roles"] = task.config.model_roles.summary()
+        # Redact custom-provider secrets even in basic failure/cancellation records.
+        safe = redact_credentials({"config": task_config, "error": error})
+        task_config, error = safe["config"], safe["error"]
+        agent_config = (task_config.get("model_roles") or {}).get("agent") or {}
+        model_name = agent_config.get("model_id", task.config.model_name)
         if result is None or cancelled:
             if cancelled and isinstance(result, dict):
                 metadata = result.get("metadata") or {}
@@ -174,8 +189,8 @@ class TaskManager:
             result = build_run_result(
                 context=context or RunContext(task.task_id, task.started_at, task.started_perf),
                 status="cancelled" if cancelled else "failed", test_type=task.config.test_type.lower(),
-                tool=task.config.tool_id, model=task.config.model_name,
-                config=asdict(task.config), summary={}, results=[],
+                tool=task.config.tool_id, model=model_name,
+                config=task_config, summary={}, results=[],
                 json_path=None, html_path=None, task_id=task.task_id, error=error,
             )
             # Reuse the exact context supplied to the Runner, even before it returns.
@@ -190,7 +205,7 @@ class TaskManager:
             result["metadata"] = {**result["metadata"], **worker_info}
         if cleanup_error:
             result["cleanup_error"] = cleanup_error
-        result["task_config"] = asdict(task.config)
+        result["task_config"] = task_config
         result = persist_run(result, task_id=task.task_id, root=self._store_root)
         persistence = result["persistence"]
         return replace(
@@ -202,7 +217,17 @@ class TaskManager:
             cleanup_error=cleanup_error,
         )
 
-    def _run(self, task, cancelled, context):
+    def _run(self, task, cancelled, context, temporary_credentials=None):
+        # Parent diagnostics/publication use the same exact-value redaction.
+        # No process-wide environment or logger configuration is changed here.
+        with credential_scope(temporary_credentials):
+            try:
+                self._run_owned(task, cancelled, context, temporary_credentials)
+            finally:
+                if temporary_credentials is not None:
+                    temporary_credentials.clear()
+
+    def _run_owned(self, task, cancelled, context, temporary_credentials=None):
         worker = None
         result = None
         error = None
@@ -214,6 +239,7 @@ class TaskManager:
                 worker = factory(
                     task.task_id, task.config, store_root=self._store_root,
                     run_context=context, execute=self._execute,
+                    **({"temporary_credentials": temporary_credentials} if temporary_credentials else {}),
                 )
                 with self._lock:
                     self._worker = worker
@@ -276,12 +302,17 @@ class TaskManager:
                         # Worker is already dead. Retain cleanup diagnostics.
                         cleanup_error = redact_credentials(f"{type(exc).__name__}: {exc}")
                 if self._task.task_id == task.task_id:
-                    self._task = self._finish(
+                    finished = self._finish(
                         task, result, None if is_cancelled else error,
                         context=context, cancelled=is_cancelled,
                         cleanup_error=cleanup_error,
                         worker_info=worker_info,
                     )
+                    # Finish redaction/persistence, then drop the task's secret
+                    # values before exposing a terminal state or a new slot.
+                    if temporary_credentials is not None:
+                        temporary_credentials.clear()
+                    self._task = finished
                     if not is_cancelled and error is None:
                         self._last_result = self._task.result
                 self._worker = None
